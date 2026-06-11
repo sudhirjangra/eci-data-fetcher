@@ -1,0 +1,15 @@
+{
+  "name": "eci-scraper",
+  "version": "2.1.0",
+  "description": "Parallel ECI results scraper using Puppeteer + stealth — bypasses Akamai bot detection",
+  "type": "module",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
