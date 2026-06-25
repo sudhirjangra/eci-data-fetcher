@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 import { load } from 'cheerio';
 import readline from 'readline';
 import fs from 'fs';
