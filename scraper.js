@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
-import puppeteerExtra from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { load } from 'cheerio';
 import readline from 'readline';
 import fs from 'fs';
 import path from 'path';
@@ -9,10 +8,10 @@ import { fileURLToPath } from 'url';
 import { fetchAllRows, fetchRoundsForIds, upsertRows } from './db.js';
 import { ECI_SELECTORS, CONFIG } from './config.js';
 
-puppeteerExtra.use(StealthPlugin());
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const csvPath = path.join(__dirname, 'portal-urls.csv');
+
+let cycleCount = 0;
 
 function parseCsv(filePath) {
   const lines = fs.readFileSync(filePath, 'utf-8').trim().split('\n');
@@ -27,15 +26,34 @@ function parseCsv(filePath) {
   return states;
 }
 
-function ask(prompt) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise(resolve => rl.question(prompt, ans => { rl.close(); resolve(ans.trim()); }));
+let rl = null;
+let lines = [];
+let lineIdx = 0;
+
+async function ask(prompt) {
+  if (!rl) {
+    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.on('line', line => lines.push(line));
+  }
+
+  process.stdout.write(prompt);
+
+  return new Promise(resolve => {
+    const check = () => {
+      if (lineIdx < lines.length) {
+        resolve(lines[lineIdx++].trim());
+      } else {
+        setImmediate(check);
+      }
+    };
+    check();
+  });
 }
 
 async function showStateMenu(states) {
   console.clear();
   console.log('\n╔══════════════════════════════════════════════════════╗');
-  console.log('║        ECI RESULTS SCRAPER — STATE SELECTOR         ║');
+  console.log('║        ECI RESULTS SCRAPER — STATE SELECTOR          ║');
   console.log('╚══════════════════════════════════════════════════════╝\n');
   const rows = Math.ceil(states.length / 2);
   for (let r = 0; r < rows; r++) {
@@ -54,115 +72,45 @@ async function showStateMenu(states) {
   return (idx >= 0 && idx < states.length) ? states[idx] : null;
 }
 
-// ── ANSI DASHBOARD ────────────────────────────────────────────────────────────
-const HIDE_CURSOR = '\x1b[?25l';
-const SHOW_CURSOR = '\x1b[?25h';
-const HOME_CLEAR  = '\x1b[2J\x1b[H';
-
-const logBuffer = [];
-const MAX_LOGS = 4;
-
-function hijackConsole() {
-  const orig = { log: console.log, warn: console.warn, error: console.error };
-  const push = (...args) => {
-    const msg = args.map(a => String(a)).join(' ').replace(/\x1b\[[0-9;]*m/g, '');
-    logBuffer.push(msg.slice(0, 120));
-    if (logBuffer.length > MAX_LOGS) logBuffer.shift();
-  };
-  console.log = push;
-  console.warn = push;
-  console.error = push;
-}
-
-function renderDashboard(selectedState, numInstances, stats, startTime, totals) {
-  const termW   = Math.max(80, process.stdout.columns || 80);
-  const colW    = Math.floor((termW - numInstances - 1) / numInstances);
-  const totalW  = colW * numInstances + numInstances + 1;
-
-  const pad = (text, w) => {
-    const t = String(text ?? '');
-    return t.length >= w ? ' ' + t.slice(0, w - 2) + ' ' : ' ' + t + ' '.repeat(w - 1 - t.length);
-  };
-
-  const hLine = (left, mid, right, fill = '─') => {
-    let s = left;
-    for (let i = 0; i < numInstances; i++) s += fill.repeat(colW) + (i < numInstances - 1 ? mid : right);
-    return s;
-  };
-
-  const dataRow = (values, rawWidths) => {
-    let s = '│';
-    for (let i = 0; i < numInstances; i++) {
-      const raw = rawWidths?.[i] ?? 0;
-      const cell = values[i] ?? '';
-      const visibleLen = raw || cell.length;
-      const padding = Math.max(0, colW - visibleLen - 1);
-      s += ' ' + cell + ' '.repeat(padding) + '│';
-    }
-    return s;
-  };
-
-  const elapsed   = Math.floor((Date.now() - startTime) / 1000);
-  const elapsedStr = `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`;
-  const title     = `ECI SCRAPER  ·  ${selectedState.state}  ·  ${numInstances} instance${numInstances > 1 ? 's' : ''}  ·  +${elapsedStr}`;
-
-  const statusStr = s => s.scraping ? '\x1b[33m⟳ Running\x1b[0m' : s.error ? '\x1b[31m✗ Error  \x1b[0m' : '\x1b[32m✓ Idle   \x1b[0m';
-
-  const lines = [];
-  lines.push('┌' + '─'.repeat(totalW - 2) + '┐');
-  lines.push('│' + pad(title, totalW - 1) + '│');
-  lines.push(hLine('├', '┬', '┤'));
-  lines.push(dataRow(stats.map((_, i) => `  Instance ${i + 1}`)));
-  lines.push(dataRow(stats.map(s => `  Pages: [${s.pages.join(',')}]`)));
-  lines.push(hLine('├', '┼', '┤'));
-  lines.push(dataRow(stats.map(s => `   ${statusStr(s)}`), stats.map(() => 12)));
-  lines.push(dataRow(stats.map(s => `  Cycle    #${s.cycle}`)));
-  lines.push(dataRow(stats.map(s => `  Items     ${s.items}`)));
-  lines.push(dataRow(stats.map(s => `  Changes   ${s.changes}`)));
-  lines.push(dataRow(stats.map(s => `  Errors    ${s.errors}`)));
-  lines.push(dataRow(stats.map(s => `  Last  ${s.lastCycleTime || '--:--:--'}`)));
-  lines.push(hLine('├', '┴', '┤'));
-  lines.push('│' + pad(`  Total upserted: ${totals.upserted}  ·  Round changes: ${totals.changes}`, totalW - 1) + '│');
-  lines.push('└' + '─'.repeat(totalW - 2) + '┘');
-  if (logBuffer.length > 0) {
-    logBuffer.forEach(msg => lines.push('  ' + msg));
-  }
-  lines.push('  Ctrl+C to stop');
-
-  return lines.join('\n');
-}
-
 // ── PAGE DISCOVERY ─────────────────────────────────────────────────────────────
 async function discoverPages(url) {
-  const browser = await puppeteerExtra.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
-  });
   try {
-    const tab = await browser.newPage();
-    await tab.goto(url, { waitUntil: 'load', timeout: CONFIG.FETCH_TIMEOUT_MS });
-    await tab.waitForSelector(ECI_SELECTORS.pagination, { timeout: 10000 }).catch(() => {});
+    const headers = {
+      'Accept-Language': 'en-IN,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    };
+    const res = await fetch(url, { headers, timeout: CONFIG.FETCH_TIMEOUT_MS });
+    if (!res.ok) {
+      console.warn(`  Page load failed: ${res.status} ${res.statusText}`);
+      return { pageUrlMap: new Map([[1, url]]), detectedState: null };
+    }
+    const html = await res.text();
+    const $ = load(html);
 
-    const { links, detectedState } = await tab.evaluate(sel => ({
-      links: Array.from(document.querySelectorAll(sel)).map(a => ({
-        text: a.textContent?.trim(),
-        href: a.href
-      })),
-      detectedState: document.querySelector('.page-title h2 span')?.textContent?.trim() || null
-    }), ECI_SELECTORS.pagination);
+    const links = [];
+    $(ECI_SELECTORS.pagination).each((_, el) => {
+      const text = $(el).text().trim();
+      const href = $(el).attr('href');
+      if (text && href) links.push({ text, href });
+    });
 
-    await tab.close().catch(() => {});
+    const detectedState = $('.page-title h2 span').text().trim() || null;
 
     const pageUrlMap = new Map();
     links.forEach(({ text, href }) => {
       const n = parseInt(text, 10);
-      if (!isNaN(n) && href) pageUrlMap.set(n, href);
+      if (!isNaN(n) && href) {
+        const fullUrl = href.startsWith('http') ? href : new URL(href, url).href;
+        pageUrlMap.set(n, fullUrl);
+      }
     });
     if (!pageUrlMap.has(1)) pageUrlMap.set(1, url);
 
     return { pageUrlMap, detectedState };
-  } finally {
-    await browser.close().catch(() => {});
+  } catch (err) {
+    console.warn(`  Discovery failed: ${err.message}`);
+    return { pageUrlMap: new Map([[1, url]]), detectedState: null };
   }
 }
 
@@ -181,71 +129,81 @@ async function loadEciMap(stateName) {
   return { eciMapCache, count: eciMapCache.size };
 }
 
+function getPageUrl(baseUrl, pageNum, pageUrlMap) {
+  if (pageUrlMap.has(pageNum)) return pageUrlMap.get(pageNum);
+  const m = baseUrl.match(/^(.*?)(\d+)(\.htm)$/i);
+  if (m) return `${m[1]}${parseInt(m[2], 10) + (pageNum - 1)}${m[3]}`;
+  return baseUrl.replace(/\.htm$/i, `p${pageNum}.htm`);
+}
+
 // ── SCRAPE ─────────────────────────────────────────────────────────────────────
-async function scrapePageWithTab(browser, pageNum, baseUrl, stateName, pageUrlMap) {
-  const url = pageUrlMap.has(pageNum)
-    ? pageUrlMap.get(pageNum)
-    : (() => {
-        const m = baseUrl.match(/^(.*?)(\d+)(\.htm)$/i);
-        return m ? `${m[1]}${parseInt(m[2], 10) + (pageNum - 1)}${m[3]}` : baseUrl;
-      })();
+async function scrapePageWithFetch(pageNum, baseUrl, stateName, pageUrlMap) {
+  const url = getPageUrl(baseUrl, pageNum, pageUrlMap);
 
-  const tab = await browser.newPage();
   try {
-    await tab.setExtraHTTPHeaders({
+    const headers = {
       'Accept-Language': 'en-IN,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    });
-    await tab.goto(url, { waitUntil: 'load', timeout: CONFIG.FETCH_TIMEOUT_MS });
-    await tab.waitForFunction(
-      () => {
-        const rows = document.querySelectorAll('.custom-table tbody tr');
-        for (const row of rows) {
-          if (row.querySelectorAll(':scope > td').length >= 8) return true;
-        }
-        return false;
-      },
-      { timeout: 20000 }
-    ).catch(() => {});
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    };
+    const res = await fetch(url, { headers, timeout: CONFIG.FETCH_TIMEOUT_MS });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 
-    return await tab.evaluate((sel, state) => {
-      const result = [];
-      document.querySelectorAll(sel.tableRows).forEach(row => {
-        const cells = Array.from(row.children).filter(el => el.tagName === 'TD');
-        if (cells.length < 8) return;
-        const constName  = (cells[sel.colName]?.childNodes[0]?.textContent || '').trim() ||
-                            cells[sel.colName]?.textContent?.trim();
-        const eciIdRaw   = cells[sel.colEciId]?.textContent?.trim();
-        const roundRaw   = (cells[sel.colRound]?.textContent || '').replace(/\s+/g, '');
-        const resultStatus = cells[sel.colStatus]?.textContent?.trim() || '';
-        if (!constName || !eciIdRaw) return;
-        const eciId = parseInt(eciIdRaw, 10);
-        if (isNaN(eciId)) return;
-        const m = roundRaw.match(/^(\d+)\/(\d+)$/);
-        result.push({ stateName: state, constName, eciId, currentRound: m ? parseInt(m[1], 10) : 0, resultStatus });
+    const html = await res.text();
+    const $ = load(html);
+
+    const result = [];
+    $(ECI_SELECTORS.tableRows).each((_, row) => {
+      const $row = $(row);
+      const cells = $row.find('> td');
+      if (cells.length < 8) return;
+
+      const nameCell = cells.eq(ECI_SELECTORS.colName);
+      const constName = (nameCell[0]?.firstChild?.textContent || '').trim() || nameCell.text().trim();
+
+      const eciIdRaw = cells.eq(ECI_SELECTORS.colEciId).text().trim();
+      const roundRaw = cells.eq(ECI_SELECTORS.colRound).text().replace(/\s+/g, '');
+      const resultStatus = cells.eq(ECI_SELECTORS.colStatus).text().trim() || '';
+
+      if (!constName || !eciIdRaw) return;
+      const eciId = parseInt(eciIdRaw, 10);
+      if (isNaN(eciId)) return;
+
+      const m = roundRaw.match(/^(\d+)\/(\d+)$/);
+      const currentRound = m ? parseInt(m[1], 10) : 0;
+
+      result.push({
+        stateName,
+        constName,
+        eciId,
+        currentRound,
+        resultStatus
       });
-      return result;
-    }, ECI_SELECTORS, stateName);
-  } finally {
-    await tab.close().catch(() => {});
+    });
+
+    return result;
+  } catch (err) {
+    console.error(`  Fetch page ${pageNum} failed: ${err.message}`);
+    return [];
   }
 }
 
 // ── BATCH PROCESS ──────────────────────────────────────────────────────────────
 async function processBatch(items, eciMapCache, dbRoundCache, dbStatusCache, heartbeatCache) {
-  if (items.length === 0) return { upserted: 0, roundChanges: 0 };
+  if (items.length === 0) return { upserted: 0, roundChanges: 0, unmapped: 0 };
 
   const deduped = new Map();
+  let unmapped = 0;
   for (const item of items) {
     const constId = eciMapCache.get(`${item.stateName}_${item.eciId}`);
-    if (!constId) continue;
+    if (!constId) { unmapped++; continue; }
     const existing = deduped.get(constId);
     if (!existing || item.currentRound > existing.currentRound) {
       deduped.set(constId, { constId, currentRound: item.currentRound, resultStatus: item.resultStatus || '' });
     }
   }
 
-  if (deduped.size === 0) return { upserted: 0, roundChanges: 0 };
+  if (deduped.size === 0) return { upserted: 0, roundChanges: 0, unmapped };
 
   try {
     const rows = await fetchRoundsForIds(Array.from(deduped.keys()));
@@ -262,7 +220,9 @@ async function processBatch(items, eciMapCache, dbRoundCache, dbStatusCache, hea
 
   const now = new Date().toISOString();
   const nowMs = Date.now();
-  const changed = [];
+  const changedRoundOnly = [];
+  const changedStatusOnly = [];
+  const changedWithDeclared = [];
   const heartbeat = [];
   let roundChanges = 0;
 
@@ -284,7 +244,14 @@ async function processBatch(items, eciMapCache, dbRoundCache, dbStatusCache, hea
           row.result_declared_at = now;
         }
       }
-      changed.push(row);
+
+      if (!row.result_status && !row.result_declared_at) {
+        changedRoundOnly.push(row);
+      } else if (row.result_status && !row.result_declared_at) {
+        changedStatusOnly.push(row);
+      } else {
+        changedWithDeclared.push(row);
+      }
     } else {
       const lastHb = heartbeatCache.get(constId) ?? 0;
       if (nowMs - lastHb >= CONFIG.HEARTBEAT_INTERVAL_MS) {
@@ -294,16 +261,22 @@ async function processBatch(items, eciMapCache, dbRoundCache, dbStatusCache, hea
     }
   }
 
-  await upsertRows(changed.filter(r => !r.result_status && !r.result_declared_at), 'Round');
-  await upsertRows(changed.filter(r =>  r.result_status && !r.result_declared_at), 'Status');
-  await upsertRows(changed.filter(r =>  r.result_status &&  r.result_declared_at), 'Declared');
-  await upsertRows(heartbeat, 'Heartbeat');
+  await upsertRows(changedRoundOnly, 'EciChanged-RoundOnly');
+  await upsertRows(changedStatusOnly, 'EciChanged-StatusOnly');
+  await upsertRows(changedWithDeclared, 'EciChanged-Declared');
+  await upsertRows(heartbeat, 'EciHeartbeat');
 
-  return { upserted: changed.length + heartbeat.length, roundChanges };
+  const total = changedRoundOnly.length + changedStatusOnly.length + changedWithDeclared.length + heartbeat.length;
+  return { upserted: total, roundChanges, unmapped };
+}
+
+function formatTime() {
+  const now = new Date();
+  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
 }
 
 // ── RUN INSTANCE ───────────────────────────────────────────────────────────────
-async function runInstance(state, stateName, pageUrlMap, assignedPages, eciMapCache, stat, sharedTotals) {
+async function runInstance(state, stateName, pageUrlMap, assignedPages, eciMapCache, stat, sharedTotals, instanceId) {
   const dbRoundCache  = new Map();
   const dbStatusCache = new Map();
   const heartbeatCache = new Map();
@@ -320,11 +293,6 @@ async function runInstance(state, stateName, pageUrlMap, assignedPages, eciMapCa
       });
     }
   } catch (_) {}
-
-  const browser = await puppeteerExtra.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote']
-  });
 
   const refreshInterval = setInterval(async () => {
     try {
@@ -344,22 +312,27 @@ async function runInstance(state, stateName, pageUrlMap, assignedPages, eciMapCa
       stat.scraping = true;
       stat.error = false;
 
+      const time = formatTime();
+      stat.cycle++;
+      console.log(`[${time}] [Cycle ${stat.cycle}] [Instance ${instanceId}] Scraping pages: [${assignedPages.join(', ')}]`);
+
       try {
         const results = await Promise.allSettled(
           assignedPages.map((pageNum, idx) =>
             new Promise(r => setTimeout(r, idx * CONFIG.PAGE_FETCH_DELAY_MS))
-              .then(() => scrapePageWithTab(browser, pageNum, state.url, stateName, pageUrlMap))
+              .then(() => scrapePageWithFetch(pageNum, state.url, stateName, pageUrlMap))
           )
         );
 
         const allItems = [];
+        let failCount = 0;
         for (const result of results) {
           if (result.status === 'fulfilled') allItems.push(...result.value);
-          else stat.errors++;
+          else { failCount++; stat.errors++; }
         }
 
         stat.items = allItems.length;
-        const { upserted, roundChanges } = await processBatch(
+        const { upserted, roundChanges, unmapped } = await processBatch(
           allItems, eciMapCache, dbRoundCache, dbStatusCache, heartbeatCache
         );
         stat.changes += roundChanges;
@@ -371,15 +344,22 @@ async function runInstance(state, stateName, pageUrlMap, assignedPages, eciMapCa
         stat.error = true;
       }
 
-      stat.cycle++;
       stat.scraping = false;
-      stat.lastCycleTime = new Date().toLocaleTimeString();
+      stat.lastCycleTime = formatTime();
+
+      const finishTime = formatTime();
+      console.log(`[${finishTime}] [Cycle ${stat.cycle}] [Instance ${instanceId}] Finished. Items: ${stat.items}, Changes: ${stat.changes}. Total upserted: ${sharedTotals.upserted}`);
+
+      cycleCount++;
+      if (cycleCount % 25 === 0) {
+        console.clear();
+        console.log(`[${formatTime()}] ─ Terminal cleared after 25 cycles. Running totals: Upserted ${sharedTotals.upserted}, Changes ${sharedTotals.changes} ─`);
+      }
 
       await new Promise(r => setTimeout(r, CONFIG.CYCLE_PAUSE_MS));
     }
   } finally {
     clearInterval(refreshInterval);
-    await browser.close().catch(() => {});
   }
 }
 
@@ -416,19 +396,9 @@ async function main() {
     scraping: false, error: false, lastCycleTime: null
   }));
   const sharedTotals = { upserted: 0, changes: 0 };
-  const startTime = Date.now();
-
-  hijackConsole();
-
-  // const renderInterval = setInterval(() => {
-  //   process.stdout.write(HOME_CLEAR);
-  //   process.stdout.write(renderDashboard(selected, numInstances, stats, startTime, sharedTotals));
-  //   process.stdout.write('\n');
-  // }, 500);
 
   const shutdown = () => {
-    // clearInterval(renderInterval);
-    process.stdout.write(SHOW_CURSOR);
+    if (rl) rl.close();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);
@@ -438,13 +408,13 @@ async function main() {
   await Promise.all(
     Array.from({ length: numInstances }, (_, i) =>
       new Promise(r => setTimeout(r, i * 1500))
-        .then(() => runInstance(selected, stateName, pageUrlMap, assignedPages[i], eciMapCache, stats[i], sharedTotals))
+        .then(() => runInstance(selected, stateName, pageUrlMap, assignedPages[i], eciMapCache, stats[i], sharedTotals, i + 1))
     )
   );
 }
 
 main().catch(err => {
-  process.stdout.write(SHOW_CURSOR);
   console.error('Fatal:', err);
+  if (rl) rl.close();
   process.exit(1);
 });
